@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>吞食天地2 J2ME 完美资源查看器</title>
+    <style>
+        body { margin: 0; padding: 10px; background: #1e1e1e; color: #ddd; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
+        .toolbar { background: #333; padding: 10px; border-radius: 6px; margin-bottom: 10px; display: flex; gap: 15px; align-items: center; flex-wrap: wrap; }
+        select, input, button { background: #444; color: #fff; border: 1px solid #666; padding: 5px 10px; border-radius: 4px; font-size: 14px; }
+        button { cursor: pointer; border-color: #888; }
+        button:hover { background: #555; }
+        #canvas-container { flex: 1; background: #2a2a2a; border: 2px solid #555; border-radius: 6px; overflow: auto; display: flex; justify-content: center; align-items: flex-start; padding: 20px; position: relative; }
+        canvas { image-rendering: -moz-crisp-edges; image-rendering: pixelated; box-shadow: 0 0 10px rgba(0,0,0,0.5); background: #333; }
+        .success { color: #4CAF50; font-weight: bold; }
+        .error { color: #f44336; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<div class="toolbar">
+    <button id="btnLoad" style="background:#2e7d32;">1. 点击加载 res/ 资源文件</button>
+    <span id="status">等待加载...</span>
+</div>
+
+<div class="toolbar" id="viewer-controls" style="display: none;">
+    <label>模式: 
+        <select id="modeSelect">
+            <option value="anim">▶ 动作回放 (Anim VM)</option>
+            <option value="frame">■ 单帧预览 (Frame)</option>
+            <option value="sheet">▦ 全图拆解 (SpriteSheet)</option>
+            <option value="map">🗺️ 场景地图 (Map Scroll)</option>
+        </select>
+    </label>
+    
+    <label>数据组: <select id="charSelect"></select></label>
+
+    <span id="spriteControls">
+        <button id="btnPrev">上一项 (←)</button>
+        <input type="number" id="inputId" value="0" style="width: 70px; text-align:center;">
+        <button id="btnNext">下一项 (→)</button>
+    </span>
+
+    <label id="lblLoop" style="color: #ffb74d;"><input type="checkbox" id="cbIgnoreJumps" checked> 忽略硬跳(循环单动作)</label>
+</div>
+
+<div id="canvas-container">
+    <canvas id="canvas" width="400" height="400"></canvas>
+</div>
+
+<script>
+"use strict";
+
+const CHUNK_SIZE = 51200;
+const PLAYER_SPRITE_START_INDEX =[0, 39, 77, 123, 163];
+const TICK_MS = 60; 
+
+const BOSS_DATA_GROUP = [[527, 528, 529, 530, 531, 532, 533, 534, 535, 536, 537, 538, 539, 540, 541],[542, 543, 544, 545, 546, 547, 548, 549, 550, 551, 552, 553, 554, 555, 556, 557, 558],[559, 560, 561, 562, 563, 564, 565, 566, 567, 568, 569, 570, 571],[572, 573, 574, 575, 576, 577, 578, 579, 580, 581, 582, 583, 584, 585, 586, 587, 588, 589, 590, 591, 592, 593],[594, 595, 596, 597, 598, 599, 600, 601, 602, 603, 604, 605, 606, 607, 608, 609, 610, 611, 612],[613, 614, 615, 616, 617, 618, 619, 620, 621, 622]];
+const ENEMY_DATA_GROUP = [[637, 638, 639, 640, 641, 642, 643, 644, 645, 646, 647, 648, 649, 650, 651, 652],[653, 654, 655, 656, 657, 658, 659, 660, 661, 662, 663],[664, 665, 666, 667, 668, 669, 670, 671, 672, 673, 674],[675, 676, 677, 678, 679, 680, 681, 682, 683, 684, 685, 686, 687, 688, 689, 690, 691, 692, 693],[694, 695, 696, 697, 698, 699, 700, 701, 702, 703, 704, 705],[706, 707, 708, 709, 710, 711, 712, 713, 714, 715, 716, 717]];
+
+let datFiles = new Array(9);
+let pacImageBytes = {}; 
+let resourceIndexTable = [];
+
+let skleData = [];     
+let hitData = [];      
+let motionData =[];  
+let mapData =[];      
+let imageCache = {}; 
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const statusSpan = document.getElementById('status');
+const inputId = document.getElementById('inputId');
+const controls = document.getElementById('viewer-controls');
+const modeSelect = document.getElementById('modeSelect');
+const charSelect = document.getElementById('charSelect');
+const cbIgnoreJumps = document.getElementById('cbIgnoreJumps');
+const lblLoop = document.getElementById('lblLoop');
+
+let currentMode = 'anim'; 
+let currentChar = 0;
+let currentId = 0;
+let mainPlayer = 0; 
+let animCtx = { index: 0, frameId: 0, targetCharId: 0, delay: 0 };
+
+// 彻底根除越界的神级安全读取器
+class SafeReader {
+    constructor(buffer) { this.dv = new DataView(buffer); this.ptr = 0; }
+    getU8() { if (this.ptr >= this.dv.byteLength) return 0; return this.dv.getUint8(this.ptr++); }
+    getU16() { if (this.ptr + 2 > this.dv.byteLength) return 0; let v = this.dv.getUint16(this.ptr, false); this.ptr += 2; return v; }
+    getI16() { if (this.ptr + 2 > this.dv.byteLength) return 0; let v = this.dv.getInt16(this.ptr, false); this.ptr += 2; return v; }
+    getU32() { if (this.ptr + 4 > this.dv.byteLength) return 0; let v = this.dv.getUint32(this.ptr, false); this.ptr += 4; return v; }
+}
+
+document.getElementById('btnLoad').addEventListener('click', loadResources);
+
+modeSelect.addEventListener('change', (e) => {
+    currentMode = e.target.value;
+    lblLoop.style.display = (currentMode === 'anim') ? 'inline-block' : 'none';
+    populateCharDropdown();
+    currentChar = 0; currentId = 0;
+    updateViewer();
+});
+
+charSelect.addEventListener('change', (e) => { 
+    currentChar = parseInt(e.target.value); 
+    if (currentChar <= 4) mainPlayer = currentChar;
+    currentId = 0; 
+    updateViewer(); 
+});
+document.getElementById('btnNext').addEventListener('click', () => stepId(1));
+document.getElementById('btnPrev').addEventListener('click', () => stepId(-1));
+inputId.addEventListener('change', (e) => { currentId = parseInt(e.target.value); updateViewer(); });
+
+document.addEventListener('keydown', (e) => {
+    if (controls.style.display === 'none' || document.activeElement === inputId) return; 
+    if (e.key === 'ArrowRight') { stepId(1); e.preventDefault(); }
+    else if (e.key === 'ArrowLeft') { stepId(-1); e.preventDefault(); }
+});
+
+function stepId(delta) { currentId += delta; updateViewer(); }
+
+function populateCharDropdown() {
+    let oldVal = charSelect.value;
+    charSelect.innerHTML = ''; 
+    if (currentMode === 'map') {
+        for (let i = 0; i < mapData.length; i++) charSelect.innerHTML += `<option value="${i}">场景地图 Map ${i}</option>`;
+    } else {
+        charSelect.innerHTML = `
+            <optgroup label="玩家 (Players)">
+                <option value="0">0: 关羽</option><option value="1">1: 张飞</option>
+                <option value="2">2: 赵云</option><option value="3">3: 黄忠</option><option value="4">4: 魏延</option>
+            </optgroup>
+            <optgroup label="非玩家数据组 (8.dat Objects)">
+                <option value="5">5: 敌方组 1 (杂兵/特效)</option>
+                <option value="6">6: 敌方组 2 (武器/掉落)</option>
+                <option value="7">7: 敌方组 3 (BOSS/战马)</option>
+                <option value="8">8: 敌方组 4 (弓箭/火计等)</option>
+            </optgroup>`;
+    }
+    if(oldVal && charSelect.querySelector(`option[value="${oldVal}"]`)) charSelect.value = oldVal;
+}
+
+async function loadResources() {
+    document.getElementById('btnLoad').disabled = true;
+    statusSpan.textContent = "正在下载并硬核解析资源...";
+    try {
+        for (let i = 0; i <= 8; i++) {
+            const res = await fetch(`res/${i}.dat`);
+            if (res.ok) datFiles[i] = new Uint8Array(await res.arrayBuffer());
+        }
+        parseIndexTable();
+
+        for (let i = 0; i <= 5; i++) {
+            const re = await fetch(`res/e${i}png.pac`); 
+            if (re.ok) parsePacFile(await re.arrayBuffer(), ENEMY_DATA_GROUP[i]);
+            
+            // 【史诗级修复】：官方包里混入了错误数据，明确忽略 Boss2(淳于导) 和 Boss5(曹操) 的废弃 pac 文件！
+            if (i !== 2 && i !== 5) {
+                const rb = await fetch(`res/b${i}png.pac`); 
+                if (rb.ok) parsePacFile(await rb.arrayBuffer(), BOSS_DATA_GROUP[i]);
+            }
+        }
+
+        const rs = await fetch(`res/p_skle.bin`); if (rs.ok) parseSkle(await rs.arrayBuffer());
+        const rh = await fetch(`res/p_hit.bin`); if (rh.ok) parseHit(await rh.arrayBuffer());
+        const rm = await fetch(`res/p_motion.bin`); if (rm.ok) parseMotion(await rm.arrayBuffer());
+
+        if (datFiles[8]) parse8Dat(datFiles[8].buffer);
+
+        const rmap = await fetch(`res/map_skle.bin`); if (rmap.ok) parseMap(await rmap.arrayBuffer());
+        
+        statusSpan.textContent = `解析完美成功！(已避开官方b2和b5脏数据)`;
+        statusSpan.className = "success";
+        controls.style.display = "block";
+        populateCharDropdown();
+        
+        setInterval(tickAnimation, TICK_MS); 
+        updateViewer();
+    } catch (err) {
+        statusSpan.textContent = "解析崩溃: " + err.message;
+        statusSpan.className = "error";
+        console.error(err);
+    }
+    document.getElementById('btnLoad').disabled = false;
+}
+
+function parsePacFile(buffer, idArray) {
+    let reader = new SafeReader(buffer);
+    for (let i = 0; i < idArray.length; i++) {
+        let len = reader.getU16();
+        if (len <= 0) continue;
+        let actualLen = Math.min(len, buffer.byteLength - reader.ptr);
+        pacImageBytes[idArray[i]] = new Uint8Array(buffer, reader.ptr, actualLen);
+        reader.ptr += actualLen;
+    }
+}
+
+// 核心：还原 J2ME 图像 ID 全局映射
+function getGlobalImageId(localId) {
+    if (localId >= 449) return 390 + (localId - 202); 
+    if (localId >= 202) return 390 + (localId - 202); 
+    if (localId >= 145) return 291 + (localId - 145);
+    if (localId >= 75) return 220 + (localId - 74);
+    if (localId === 128) return 274;
+    if (localId >= 64) return 210 + (localId - 64);
+    return PLAYER_SPRITE_START_INDEX[mainPlayer] + localId;
+}
+
+function parseIndexTable() {
+    let reader = new SafeReader(datFiles[0].buffer);
+    let aint0 = reader.getU16(); reader.getU16(); reader.ptr += 6;
+    let aint2 = reader.getU16(); let aint3 = reader.getU16(); reader.ptr += 16;
+
+    resourceIndexTable = new Uint32Array(aint2 + aint3 + 1);
+    for (let i = 0; i < aint2 + aint3 + 1; i++) resourceIndexTable[i] = reader.getU32() + aint0;
+}
+
+function parseSkle(buffer) {
+    let reader = new SafeReader(buffer);
+    for (let c = 0; c < 5; c++) skleData[c] = readSkleDataStrict(reader);
+}
+
+function parseHit(buffer) {
+    let reader = new SafeReader(buffer);
+    for (let c = 0; c < 5; c++) hitData[c] = read2DArray(reader);
+}
+
+function parseMotion(buffer) {
+    let reader = new SafeReader(buffer);
+    for (let c = 0; c < 5; c++) {
+        let seqCount = reader.getU16(); let sequences =[];
+        for (let s = 0; s < seqCount; s++) {
+            let shortCount = reader.getU16(); let seq =[];
+            for (let k = 0; k < shortCount; k++) seq.push(reader.getU16());
+            sequences.push(seq);
+        }
+        motionData[c] = sequences;
+    }
+}
+
+function parse8Dat(buffer) {
+    let reader = new SafeReader(buffer);
+    let tableSize = reader.getU16();
+    let indexTable =[];
+    for (let i = 0; i < tableSize + 1; i++) indexTable.push(reader.getU32() + 22); 
+    
+    // 跳转到真实的 ANIMATION_DATA[1..4]
+    reader.ptr = indexTable[2];
+    
+    skleData[5] = readSkleDataStrict(reader);
+    skleData[6] = readSkleDataStrict(reader);
+    skleData[7] = readSkleDataStrict(reader);
+    skleData[8] = readSkleDataStrict(reader);
+    
+    skip2DArray(reader); skip2DArray(reader); skip2DArray(reader);
+    
+    // 敌方(Pool1) 与 Boss(Pool3) 的 Hitbox 完美对接
+    hitData[5] = read2DArray(reader);
+    hitData[7] = read2DArray(reader);
+    
+    skip2DArray(reader); skip2DArray(reader); skip2DArray(reader);
+    skip1DArray(reader); skip1DArray(reader); skip1DArray(reader);
+    
+    // 缝合在文件尾部的敌方 AI 动作序列
+    let enemySeqCount = reader.getU16();
+    let enemySequences =[];
+    for (let s = 0; s < enemySeqCount; s++) {
+        let shortCount = reader.getU16(); let seq =[];
+        for (let k = 0; k < shortCount; k++) seq.push(reader.getU16());
+        enemySequences.push(seq);
+    }
+    
+    for (let c = 0; c <= 8; c++) {
+        if (!motionData[c]) motionData[c] =[];
+        motionData[c] = motionData[c].slice(0, 93).concat(enemySequences);
+    }
+}
+
+// 严谨读取函数：坚决防止指针脱轨
+function readSkleDataStrict(reader) {
+    let frameCount = reader.getU16();
+    let frames =[];
+    for(let f = 0; f < frameCount; f++) {
+        let shortCount = reader.getU16();
+        let parts =[];
+        let numParts = Math.floor(shortCount / 3);
+        for(let p = 0; p < numParts; p++) { 
+            parts.push({ imgId: reader.getU16(), ox: reader.getI16(), oy: reader.getI16() });
+        }
+        for (let i = 0; i < (shortCount % 3); i++) reader.getU16();
+        frames.push(parts);
+    }
+    return frames;
+}
+
+function read2DArray(reader) {
+    let len = reader.getU16(); let arr =[];
+    for(let i=0; i<len; i++) {
+        let subLen = reader.getU16(); let subArr =[];
+        for(let j=0; j<subLen; j++) subArr.push(reader.getI16());
+        arr.push(subArr);
+    }
+    return arr;
+}
+function skip2DArray(reader) {
+    let len = reader.getU16();
+    for(let i = 0; i < len; i++) { let subLen = reader.getU16(); reader.ptr += subLen * 2; }
+}
+function skip1DArray(reader) { let len = reader.getU16(); reader.ptr += len * 2; }
+
+function parseMap(buffer) {
+    let reader = new SafeReader(buffer);
+    mapData =[]; 
+    let mapCount = reader.getU16();
+    for(let i = 0; i < mapCount; i++) {
+        let count = reader.getU16(); let map =[];
+        for(let j = 0; j < Math.floor(count / 3); j++) {
+            map.push({ imgId: reader.getU16(), ox: reader.getI16(), oy: reader.getI16() });
+        }
+        for (let r = 0; r < (count % 3); r++) reader.getU16();
+        mapData.push(map);
+    }
+}
+
+function getImageBytes(index) {
+    if (pacImageBytes[index]) return pacImageBytes[index];
+    if (index < 0 || index >= resourceIndexTable.length - 1) return null;
+    let start = resourceIndexTable[index], end = resourceIndexTable[index + 1];
+    let length = end - start;
+    if (length <= 0) return null;
+
+    let fStart = Math.floor(start / CHUNK_SIZE), fEnd = Math.floor(end / CHUNK_SIZE);
+    let oStart = start % CHUNK_SIZE;
+    let result = new Uint8Array(length);
+
+    if (fStart === fEnd) {
+        if (!datFiles[fStart]) return null;
+        result.set(datFiles[fStart].subarray(oStart, oStart + length), 0);
+    } else {
+        let p1Len = CHUNK_SIZE - oStart;
+        if (datFiles[fStart]) result.set(datFiles[fStart].subarray(oStart, CHUNK_SIZE), 0);
+        if (datFiles[fEnd]) result.set(datFiles[fEnd].subarray(0, length - p1Len), p1Len);
+    }
+    return result;
+}
+
+async function ensureImageLoaded(imgId) {
+    if (imageCache[imgId] !== undefined) return imageCache[imgId];
+    let bytes = getImageBytes(imgId);
+    if (!bytes || bytes.length === 0 || bytes[0] !== 0x89 || bytes[1] !== 0x50) { imageCache[imgId] = null; return null; }
+    return new Promise((resolve) => {
+        let blob = new Blob([bytes], { type: 'image/png' });
+        let url = URL.createObjectURL(blob);
+        let img = new Image();
+        img.onload = () => { imageCache[imgId] = img; URL.revokeObjectURL(url); resolve(img); };
+        img.onerror = () => { imageCache[imgId] = null; URL.revokeObjectURL(url); resolve(null); };
+        img.src = url;
+    });
+}
+
+function updateViewer() {
+    let maxId = 0;
+    if (currentMode === 'frame' || currentMode === 'sheet') maxId = skleData[currentChar] ? skleData[currentChar].length : 0;
+    else if (currentMode === 'anim') {
+        maxId = motionData[currentChar] ? motionData[currentChar].length : 0;
+        animCtx = { index: 0, frameId: 0, targetCharId: currentChar, delay: 0 }; 
+    } else if (currentMode === 'map') {
+        maxId = 999; // 无限卷轴
+    }
+    
+    if (maxId === 0) { ctx.clearRect(0,0,canvas.width,canvas.height); return; }
+    if (currentId < 0) currentId = maxId - 1;
+    if (currentId >= maxId) currentId = 0;
+    inputId.value = currentId;
+
+    if (currentMode !== 'map' && currentMode !== 'sheet') {
+        canvas.width = 400; canvas.height = 400;
+        ctx.imageSmoothingEnabled = false;
+    }
+
+    if (currentMode === 'frame') drawComposedSprite(currentChar, currentId, 200, 280, true, true);
+    else if (currentMode === 'sheet') drawSpriteSheet(currentChar);
+    else if (currentMode === 'map') drawMap(currentChar);
+}
+
+function tickAnimation() {
+    if (currentMode !== 'anim') return;
+    let seqs = motionData[currentChar];
+    if (!seqs) return;
+    let seq = seqs[currentId];
+    if (!seq || seq.length === 0) { ctx.clearRect(0,0,canvas.width,canvas.height); return; }
+
+    if (animCtx.delay > 0) { 
+        animCtx.delay--; 
+    } else {
+        let loopProtect = 0;
+        while (loopProtect++ < 50) {
+            let op = seq[animCtx.index++];
+            if (op === undefined) { animCtx.index = 0; break; }
+
+            if (op < 4096) {
+                let poolIdx = op >> 9;
+                animCtx.frameId = op & 511;
+                
+                animCtx.targetCharId = currentChar;
+                if (poolIdx > 0) animCtx.targetCharId = 4 + poolIdx;
+                else if (currentChar > 4) animCtx.targetCharId = mainPlayer;
+
+                animCtx.delay = seq[animCtx.index++];
+                break;
+            }
+
+            switch(op) {
+                case 4096: animCtx.index = seq[animCtx.index] * 2; break; 
+                case 4097: 
+                    if (cbIgnoreJumps.checked) animCtx.index = 0;
+                    else {
+                        let nextId = seq[animCtx.index];
+                        if (nextId >= 0 && nextId < seqs.length) {
+                            currentId = nextId; inputId.value = currentId;
+                            seq = seqs[currentId]; animCtx.index = 0;
+                        } else animCtx.index = 0; 
+                    }
+                    break;
+                case 4098: 
+                    if (cbIgnoreJumps.checked) animCtx.index = 0;
+                    else animCtx.index--; 
+                    return; 
+                case 4099: 
+                    animCtx.targetCharId = currentChar > 4 ? mainPlayer : currentChar;
+                    animCtx.frameId = 0; animCtx.delay = seq[animCtx.index++]; break;
+                case 4101: case 4103: case 4105: case 4106: case 4107: 
+                case 4109: case 4111: case 4112: case 4113: animCtx.index++; break;
+            }
+        }
+    }
+    drawComposedSprite(animCtx.targetCharId, animCtx.frameId, 200, 280, true, true);
+}
+
+async function drawComposedSprite(charId, frameId, anchorX, anchorY, showDebug = true, clearCanvas = true) {
+    let parts = skleData[charId] ? skleData[charId][frameId] : null;
+    if (clearCanvas) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!parts) return;
+
+    let promises =[];
+    for(let part of parts) promises.push(ensureImageLoaded(getGlobalImageId(part.imgId)));
+    await Promise.all(promises);
+
+    for (let i = parts.length - 1; i >= 0; i--) {
+        let part = parts[i];
+        let img = imageCache[getGlobalImageId(part.imgId)];
+        if (img) ctx.drawImage(img, anchorX + part.ox, anchorY + part.oy);
+    }
+
+    if (showDebug) {
+        ctx.strokeStyle = "rgba(0, 255, 0, 0.8)"; ctx.lineWidth = 1; ctx.beginPath();
+        ctx.moveTo(anchorX - 10, anchorY); ctx.lineTo(anchorX + 10, anchorY);
+        ctx.moveTo(anchorX, anchorY - 10); ctx.lineTo(anchorX, anchorY + 10); ctx.stroke();
+
+        let hc = charId; 
+        if (hitData[hc] && frameId < hitData[hc].length) {
+            let p = hitData[hc][frameId];
+            if (p && p.length >= 4 && p[2] > 0) {
+                ctx.fillStyle = "rgba(0, 100, 255, 0.4)"; ctx.strokeStyle = "blue";
+                // 蓝框 Hurtbox: (CenterX, CenterY, RadiusX, RadiusY) -> (x, y-H, w, h*2)
+                let hx = anchorX + p[0] - p[2], hy = anchorY + p[1] - p[3], hw = p[2] * 2, hh = p[3] * 2;
+                ctx.fillRect(hx, hy, hw, hh); ctx.strokeRect(hx, hy, hw, hh);
+            }
+            if (p && p.length >= 8 && p[6] > 0) {
+                ctx.fillStyle = "rgba(255, 0, 0, 0.4)"; ctx.strokeStyle = "red";
+                // 红框 Hitbox
+                let ax = anchorX + p[4] - p[6], ay = anchorY + p[5] - p[7], aw = p[6] * 2, ah = p[7] * 2;
+                ctx.fillRect(ax, ay, aw, ah); ctx.strokeRect(ax, ay, aw, ah);
+            }
+        }
+    }
+}
+
+async function drawSpriteSheet(charId) {
+    let frames = skleData[charId]; if(!frames) return;
+    const cols = 6, cellW = 180, cellH = 180;
+    const rows = Math.ceil(frames.length / cols);
+    canvas.width = cols * cellW; canvas.height = rows * cellH;
+    ctx.imageSmoothingEnabled = false; 
+    ctx.clearRect(0, 0, canvas.width, canvas.height); 
+
+    let promises =[];
+    for (let f = 0; f < frames.length; f++) {
+        for (let part of frames[f]) promises.push(ensureImageLoaded(getGlobalImageId(part.imgId)));
+    }
+    await Promise.all(promises);
+
+    for (let f = 0; f < frames.length; f++) {
+        let col = f % cols, row = Math.floor(f / cols);
+        ctx.strokeStyle = "#444"; ctx.strokeRect(col * cellW, row * cellH, cellW, cellH);
+        ctx.fillStyle = "#aaa"; ctx.font = "14px sans-serif"; ctx.fillText(`F ${f}`, col * cellW + 5, row * cellH + 15);
+        await drawComposedSprite(charId, f, col * cellW + cellW/2, row * cellH + cellH - 30, true, false);
+    }
+}
+
+async function drawMap(mapId) {
+    let map = mapData[mapId]; if(!map) return;
+    canvas.width = 800; canvas.height = 400;
+    ctx.imageSmoothingEnabled = false; ctx.fillStyle = "#1e3b5e"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    let promises =[];
+    for(let part of map) promises.push(ensureImageLoaded(getGlobalImageId(part.imgId)));
+    await Promise.all(promises);
+    
+    // 用 ID 控制卷轴水平推移
+    let cameraX = currentId * 50; 
+    for (let i = map.length - 1; i >= 0; i--) {
+        let part = map[i];
+        let img = imageCache[getGlobalImageId(part.imgId)];
+        if (img) ctx.drawImage(img, part.ox - cameraX, part.oy + 42);
+    }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>吞食天地2 J2ME - 实机战斗引擎 (分离版)</title>
+    <style>
+        body { margin: 0; padding: 0; background: #111; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; }
+        .toolbar { padding: 15px; background: #222; width: 100%; box-sizing: border-box; text-align: center; border-bottom: 2px solid #444; }
+        #game-container { margin-top: 20px; position: relative; border: 4px solid #555; border-radius: 8px; box-shadow: 0 0 20px rgba(0,0,0,0.8); }
+        /* 扩展高度，显露底部贴图区域 */
+        canvas { width: 800px; height: 600px; image-rendering: -moz-crisp-edges; image-rendering: pixelated; background: #000; display: block; }
+        .instructions { margin-top: 15px; background: #333; padding: 15px; border-radius: 6px; width: 800px; box-sizing: border-box; font-size: 14px; line-height: 1.6; }
+        .instructions span { color: #ffeb3b; font-weight: bold; background: #555; padding: 2px 6px; border-radius: 3px; }
+        #turbo-indicator { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7); padding: 5px 10px; color: #fff; border: 1px solid #ffeb3b; font-weight: bold; z-index: 10; pointer-events: none; }
+    </style>
+</head>
+<body>
+
+<div class="toolbar"><span id="status">正在加载 J2ME 资源... </span></div>
+
+<div id="game-container">
+    <div id="turbo-indicator">
+        底层连发 (U): <span id="turbo-status" style="color:#f44336">关</span> | 
+        判定框 (H): <span id="hitbox-status" style="color:#f44336">关</span>
+    </div>
+    <!-- 高度从 240 修改为 300 -->
+    <canvas id="canvas" width="400" height="300"></canvas>
+</div>
+
+<div class="instructions">
+    <h3>极致打击感与状态机基准 (TICK=40ms / 25FPS)：</h3>
+    <p><span>W S A D</span> - 移动</p>
+    <p><span>J</span> - 普攻 (卡普空连拳逻辑，不再卡死，支持打中硬直连击)</p>
+    <p><span>K</span> - 跳踢</p>
+    <p><span>L</span> - 步战保险 (无敌大招)</p>
+    <p><span>O</span> - 马上保险</p>
+    <p><span>U</span> - 切换硬件级连发模式；<span>H</span> - 切换隐藏/显示 AABB 判定框</p>
+</div>
+
+<script src="js/constants.js"></script>
+<script src="js/resource.js"></script>
+<script src="js/engine.js"></script>
+<script src="js/game.js"></script>
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+    loadCommonResources(
+        msg => document.getElementById('status').textContent = msg,
+        () => {
+            document.getElementById('status').innerHTML = `<span style="color:#4CAF50;font-weight:bold;">资源加载完毕！连拳免伤修复成功！</span>`;
+            startGame();
+        },
+        err => document.getElementById('status').textContent = "加载遇到致命错误: " + err.message
+    );
+});
+</script>
+</body>
+</html>

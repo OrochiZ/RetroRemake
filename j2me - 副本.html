@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>吞食天地2 J2ME 完美资源查看器 (模块化)</title>
+    <style>
+        body { margin: 0; padding: 10px; background: #1e1e1e; color: #ddd; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
+        .toolbar { background: #333; padding: 10px; border-radius: 6px; margin-bottom: 10px; display: flex; gap: 15px; align-items: center; flex-wrap: wrap; }
+        select, input, button { background: #444; color: #fff; border: 1px solid #666; padding: 5px 10px; border-radius: 4px; font-size: 14px; }
+        button { cursor: pointer; border-color: #888; }
+        button:hover { background: #555; }
+        #canvas-container { flex: 1; background: #2a2a2a; border: 2px solid #555; border-radius: 6px; overflow: auto; display: flex; justify-content: center; align-items: flex-start; padding: 20px; position: relative; }
+        canvas { image-rendering: -moz-crisp-edges; image-rendering: pixelated; box-shadow: 0 0 10px rgba(0,0,0,0.5); background: #333; }
+        .success { color: #4CAF50; font-weight: bold; }
+        .error { color: #f44336; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<div class="toolbar">
+    <button id="btnLoad" style="background:#2e7d32;">1. 点击加载 res/ 资源文件</button>
+    <span id="status">等待加载...</span>
+</div>
+
+<div class="toolbar" id="viewer-controls" style="display: none;">
+    <label>模式: 
+        <select id="modeSelect">
+            <option value="anim">▶ 动作回放 (Anim VM)</option>
+            <option value="frame">■ 单帧预览 (Frame)</option>
+            <option value="sheet">▦ 全图拆解 (SpriteSheet)</option>
+            <option value="map">🗺️ 场景地图 (Map Scroll)</option>
+        </select>
+    </label>
+    <label>数据组: <select id="charSelect"></select></label>
+    <span id="spriteControls">
+        <button id="btnPrev">上一项 (←)</button>
+        <input type="number" id="inputId" value="0" style="width: 70px; text-align:center;">
+        <button id="btnNext">下一项 (→)</button>
+    </span>
+    <label id="lblLoop" style="color: #ffb74d;"><input type="checkbox" id="cbIgnoreJumps" checked> 忽略硬跳</label>
+</div>
+
+<div id="canvas-container">
+    <canvas id="canvas" width="400" height="400"></canvas>
+</div>
+
+<script src="js/constants.js"></script>
+<script src="js/resource.js"></script>
+<script src="js/viewer.js"></script>
+<script>
+document.getElementById('btnLoad').addEventListener('click', () => {
+    document.getElementById('btnLoad').disabled = true;
+    document.getElementById('status').textContent = "正在下载并解析...";
+    loadAllResources(
+        () => { 
+            document.getElementById('status').innerHTML = `<span class="success">解析完美成功！全敌人 Hitbox 已恢复！</span>`;
+            window.startViewer();
+        },
+        (e) => { 
+            document.getElementById('status').innerHTML = `<span class="error">崩溃: ${e.message}</span>`;
+        }
+    );
+});
+</script>
+</body>
+</html>

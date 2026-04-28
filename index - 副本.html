@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>吞食天地2 J2ME - 终极状态机复刻版</title>
+    <style>
+        body { margin: 0; padding: 0; background: #111; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; }
+        .toolbar { padding: 15px; background: #222; width: 100%; box-sizing: border-box; text-align: center; border-bottom: 2px solid #444; }
+        #game-container { margin-top: 20px; position: relative; border: 4px solid #555; border-radius: 8px; box-shadow: 0 0 20px rgba(0,0,0,0.8); }
+        canvas { width: 800px; height: 480px; image-rendering: -moz-crisp-edges; image-rendering: pixelated; background: #000; display: block; }
+        .instructions { margin-top: 15px; background: #333; padding: 15px; border-radius: 6px; width: 800px; box-sizing: border-box; font-size: 14px; line-height: 1.6; }
+        .instructions span { color: #ffeb3b; font-weight: bold; background: #555; padding: 2px 6px; border-radius: 3px; }
+        #turbo-indicator { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.7); padding: 5px 10px; color: #fff; border: 1px solid #ffeb3b; font-weight: bold; z-index: 10; }
+    </style>
+</head>
+<body>
+
+<div class="toolbar"><span id="status">正在加载 J2ME 资源...</span></div>
+
+<div id="game-container">
+    <div id="turbo-indicator">
+        连发模式 (U键): <span id="turbo-status" style="color:#f44336">关闭</span> | 
+        判定框 (H键): <span id="hitbox-status" style="color:#4CAF50">开启</span>
+    </div>
+    <canvas id="canvas" width="400" height="240"></canvas>
+</div>
+
+<div class="instructions">
+    <h3>最终状态机验证版 (严丝合缝对齐 C# 移植基准)：</h3>
+    <p><span>W S A D</span> - 移动 (触发 gs[25] = 1, 松开后平滑切回 gs[25] = 0 待机)</p>
+    <p><span>J</span> - 普攻 (Anim 3, State 2。命中触发连招窗口，独立按 J 才出下拳！)</p>
+    <p><span>K</span> - 跳踢 (Anim 8, State 9。原汁原味 J2ME 重力系统，起跳初瞬支持方向微调！)</p>
+    <p><span>L</span> - 保险 (Anim 33, State 33。J2ME无马保险姿势，硬编码 Radius 64 全屏击飞！)</p>
+    <p><span>U</span> - IO级硬件连发 (底层脉冲，按住等于每秒狂点15下！)</p>
+    <p><span>H</span> - 显示/隐藏 判定框与锚点十字</p>
+</div>
+
+<script>
+"use strict";
+
+const CHUNK_SIZE = 51200;
+const PLAYER_SPRITE_START_INDEX =[0, 39, 77, 123, 163];
+const TICK_MS = 33; // 终极修复：30 FPS (原版 Thread.sleep(33))，解决移动和动画过快问题！
+
+// J2ME 常量表
+const COMBO_FINISHER_TABLE =[0, 0, 0, 4, 6, 0, 0, 0, 10, 11, 0, 0, 0, 0];
+const KNOCKDOWN_Z =[-18, -10, -8, -6, -4, -2, 0, 0, 0, 0, 2, 4, 6, 10, 18, -8, -6, -4, -2, 2, 4, 6, 8];
+
+const BOSS_DATA_GROUP = [[527,528,529,530,531,532,533,534,535,536,537,538,539,540,541],[542,543,544,545,546,547,548,549,550,551,552,553,554,555,556,557,558],[559,560,561,562,563,564,565,566,567,568,569,570,571],[572,573,574,575,576,577,578,579,580,581,582,583,584,585,586,587,588,589,590,591,592,593],[594,595,596,597,598,599,600,601,602,603,604,605,606,607,608,609,610,611,612],[613,614,615,616,617,618,619,620,621,622]];
+const ENEMY_DATA_GROUP = [[637,638,639,640,641,642,643,644,645,646,647,648,649,650,651,652],[653,654,655,656,657,658,659,660,661,662,663],[664,665,666,667,668,669,670,671,672,673,674],[675,676,677,678,679,680,681,682,683,684,685,686,687,688,689,690,691,692,693],[694,695,696,697,698,699,700,701,702,703,704,705],[706,707,708,709,710,711,712,713,714,715,716,717]];
+
+let datFiles = new Array(9);
+let pacImageBytes = {}; 
+let resourceIndexTable = [];
+let skleData =[];     
+let hitData =[];      
+let motionData =[];  
+let mapData =[];      
+let imageCache = {}; 
+
+let turboMode = false;
+let showHitboxes = true;
+
+class SafeReader {
+    constructor(buffer) { this.dv = new DataView(buffer); this.ptr = 0; }
+    getU8() { if (this.ptr >= this.dv.byteLength) return 0; return this.dv.getUint8(this.ptr++); }
+    getU16() { if (this.ptr + 2 > this.dv.byteLength) return 0; let v = this.dv.getUint16(this.ptr, false); this.ptr += 2; return v; }
+    getI16() { if (this.ptr + 2 > this.dv.byteLength) return 0; let v = this.dv.getInt16(this.ptr, false); this.ptr += 2; return v; }
+    getU32() { if (this.ptr + 4 > this.dv.byteLength) return 0; let v = this.dv.getUint32(this.ptr, false); this.ptr += 4; return v; }
+}
+
+window.addEventListener('DOMContentLoaded', loadResources);
+
+async function loadResources() {
+    const status = document.getElementById('status');
+    try {
+        for (let i = 0; i <= 8; i++) {
+            try { let res = await fetch(`res/${i}.dat`); if (res.ok) datFiles[i] = new Uint8Array(await res.arrayBuffer()); } catch(e) {}
+        }
+        
+        let r = new SafeReader(datFiles[0].buffer);
+        let aint0 = r.getU16(); r.getU16(); r.ptr += 6;
+        let aint2 = r.getU16(); let aint3 = r.getU16(); r.ptr += 16;
+        resourceIndexTable = new Uint32Array(aint2 + aint3 + 1);
+        for (let i = 0; i < aint2 + aint3 + 1; i++) resourceIndexTable[i] = r.getU32() + aint0;
+
+        for (let i = 0; i <= 5; i++) {
+            try { let re = await fetch(`res/e${i}png.pac`); if (re.ok) parsePacFile(await re.arrayBuffer(), ENEMY_DATA_GROUP[i]); } catch(e){}
+            try { let rb = await fetch(`res/b${i}png.pac`); if (rb.ok) parsePacFile(await rb.arrayBuffer(), BOSS_DATA_GROUP[i]); } catch(e){}
+        }
+
+        try { let rs = await fetch(`res/p_skle.bin`); if (rs.ok) { let r = new SafeReader(await rs.arrayBuffer()); for(let i=0;i<5;i++) skleData[i] = readSkleDataStrict(r); } } catch(e){}
+        try { let rh = await fetch(`res/p_hit.bin`); if (rh.ok) { let r = new SafeReader(await rh.arrayBuffer()); for(let i=0;i<5;i++) hitData[i] = read2DArray(r); } } catch(e){}
+        try { let rm = await fetch(`res/p_motion.bin`); if (rm.ok) { 
+            let r = new SafeReader(await rm.arrayBuffer()); 
+            for(let c=0;c<5;c++) {
+                let sc = r.getU16(); motionData[c] =[];
+                for(let s=0;s<sc;s++) { let c2 = r.getU16(); let seq=[]; for(let k=0;k<c2;k++) seq.push(r.getU16()); motionData[c].push(seq); }
+            }
+        }} catch(e){}
+
+        if (datFiles[8]) {
+            let r = new SafeReader(datFiles[8].buffer);
+            let ts = r.getU16(); let it =[];
+            for (let i = 0; i < ts + 1; i++) it.push(r.getU32() + 22);
+            r.ptr = it[2];
+            skleData[5] = readSkleDataStrict(r); skleData[6] = readSkleDataStrict(r); skleData[7] = readSkleDataStrict(r); skleData[8] = readSkleDataStrict(r);
+            skip2DArray(r); skip2DArray(r); skip2DArray(r);
+            hitData[1] = read2DArray(r); hitData[2] = read2DArray(r); 
+            skip2DArray(r); skip2DArray(r); skip2DArray(r); skip1DArray(r); skip1DArray(r); skip1DArray(r);
+            let esc = r.getU16(); let eseqs =[];
+            for (let s = 0; s < esc; s++) { let c2 = r.getU16(); let seq =[]; for (let k = 0; k < c2; k++) seq.push(r.getU16()); eseqs.push(seq); }
+            for (let c = 0; c <= 8; c++) { if(!motionData[c]) motionData[c]=[]; motionData[c] = motionData[c].slice(0, 93).concat(eseqs); }
+        }
+
+        try { let rmap = await fetch(`res/map_skle.bin`); if (rmap.ok) {
+            let r = new SafeReader(await rmap.arrayBuffer());
+            let mc = r.getU16();
+            for(let i=0;i<mc;i++) {
+                let c = r.getU16(); let m=[];
+                for(let j=0;j<Math.floor(c/3);j++) m.push({ imgId: r.getU16(), ox: r.getI16(), oy: r.getI16() });
+                for(let k=0;k<(c%3);k++) r.getU16();
+                mapData.push(m);
+            }
+        }} catch(e){}
+        
+        status.innerHTML = `<span class="success">资源与状态机已完美就绪！</span>`;
+        initGame();
+    } catch (e) {
+        status.textContent = "加载错误: " + e.message;
+    }
+}
+
+function parsePacFile(buffer, idArray) {
+    let r = new SafeReader(buffer);
+    for (let i = 0; i < idArray.length; i++) {
+        let len = r.getU16(); if (len <= 0) continue;
+        pacImageBytes[idArray[i]] = new Uint8Array(buffer, r.ptr, len); r.ptr += len;
+    }
+}
+function readSkleDataStrict(r) {
+    let fc = r.getU16(); let fs =[];
+    for(let f=0;f<fc;f++) {
+        let c = r.getU16(); let ps =[];
+        for(let p=0;p<Math.floor(c/3);p++) ps.push({ imgId: r.getU16(), ox: r.getI16(), oy: r.getI16() });
+        for (let i=0;i<(c%3);i++) r.getU16();
+        fs.push(ps);
+    } return fs;
+}
+function read2DArray(r) { let len = r.getU16(); let a=[]; for(let i=0;i<len;i++){ let sl=r.getU16(); let sa=[]; for(let j=0;j<sl;j++) sa.push(r.getI16()); a.push(sa); } return a; }
+function skip2DArray(r) { let len = r.getU16(); for(let i=0;i<len;i++) r.ptr += r.getU16()*2; }
+function skip1DArray(r) { r.ptr += r.getU16()*2; }
+
+function getGlobalImageId(localId) {
+    if (localId >= 449) return 390 + (localId - 202); 
+    if (localId >= 202) return 390 + (localId - 202); 
+    if (localId >= 145) return 291 + (localId - 145);
+    if (localId >= 75) return 220 + (localId - 74);
+    if (localId === 128) return 274;
+    if (localId >= 64) return 210 + (localId - 64);
+    return PLAYER_SPRITE_START_INDEX[0] + localId; 
+}
+
+async function ensureImageLoaded(imgId) {
+    if (imageCache[imgId] !== undefined) return imageCache[imgId];
+    let bytes = pacImageBytes[imgId];
+    if (!bytes) {
+        if (imgId < 0 || imgId >= resourceIndexTable.length - 1) return null;
+        let start = resourceIndexTable[imgId], end = resourceIndexTable[imgId + 1], length = end - start;
+        if (length <= 0) return null;
+        let fStart = Math.floor(start / CHUNK_SIZE), fEnd = Math.floor(end / CHUNK_SIZE), oStart = start % CHUNK_SIZE;
+        bytes = new Uint8Array(length);
+        if (fStart === fEnd && datFiles[fStart]) bytes.set(datFiles[fStart].subarray(oStart, oStart + length), 0);
+        else if (datFiles[fStart] && datFiles[fEnd]) { bytes.set(datFiles[fStart].subarray(oStart, CHUNK_SIZE), 0); bytes.set(datFiles[fEnd].subarray(0, length - (CHUNK_SIZE - oStart)), CHUNK_SIZE - oStart); }
+    }
+    if (!bytes || bytes.length === 0 || bytes[0] !== 0x89) { imageCache[imgId] = null; return null; }
+    return new Promise((resolve) => {
+        let url = URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
+        let img = new Image();
+        img.onload = () => { imageCache[imgId] = img; URL.revokeObjectURL(url); resolve(img); };
+        img.onerror = () => { imageCache[imgId] = null; resolve(null); };
+        img.src = url;
+    });
+}
+
+// ==========================================
+// 纯正的底层输入 (IO Hardware Level)
+// ==========================================
+
+const rawKeys = { w:0, a:0, s:0, d:0, j:0, k:0, l:0, u:0, h:0 };
+const keyMap = { 'w':'w', 'a':'a', 's':'s', 'd':'d', 'j':'j', 'k':'k', 'l':'l', 'u':'u', 'h':'h' };
+
+window.onkeydown = e => { let k = keyMap[e.key.toLowerCase()]; if (k) rawKeys[k] = 1; };
+window.onkeyup = e => { let k = keyMap[e.key.toLowerCase()]; if (k) rawKeys[k] = 0; };
+
+let keyState = { w:0, a:0, s:0, d:0, j:0, k:0, l:0 };
+let keyJustPressed = { w:0, a:0, s:0, d:0, j:0, k:0, l:0 };
+let prevKeyState = { w:0, a:0, s:0, d:0, j:0, k:0, l:0 };
+let turboCounter = 0;
+
+function pollInput() {
+    if (rawKeys.u && !prevKeyState.u) {
+        turboMode = !turboMode;
+        document.getElementById('turbo-status').textContent = turboMode ? "开启" : "关闭";
+        document.getElementById('turbo-status').style.color = turboMode ? "#4CAF50" : "#f44336";
+    }
+    prevKeyState.u = rawKeys.u;
+
+    if (rawKeys.h && !prevKeyState.h) {
+        showHitboxes = !showHitboxes;
+        document.getElementById('hitbox-status').textContent = showHitboxes ? "开启" : "关闭";
+        document.getElementById('hitbox-status').style.color = showHitboxes ? "#4CAF50" : "#f44336";
+    }
+    prevKeyState.h = rawKeys.h;
+
+    turboCounter++;
+    // 硬件连发脉冲模拟 (2帧按，2帧松)
+    let pulse = turboMode ? ((turboCounter % 4) < 2) : true;
+
+    keyState.w = rawKeys.w; keyState.s = rawKeys.s; keyState.a = rawKeys.a; keyState.d = rawKeys.d;
+    keyState.j = rawKeys.j && pulse;
+    keyState.k = rawKeys.k && pulse;
+    keyState.l = rawKeys.l && pulse;
+
+    for(let k in keyState) {
+        keyJustPressed[k] = (keyState[k] && !prevKeyState[k]) ? 1 : 0;
+        prevKeyState[k] = keyState[k];
+    }
+}
+
+// ==========================================
+// J2ME 实体管理器 (EntityManager)
+// ==========================================
+class Entity {
+    constructor(charId, type, x, y) {
+        this.charId = charId; this.type = type; 
+        this.x = x; this.y = y; this.z = 0;
+        this.vx = 0; this.vy = 0; this.vz = 0;
+        this.dir = 1; 
+        this.offsetY = 0; 
+
+        this.animSeq = 0; this.animIdx = 0;
+        this.frameId = 0; this.delay = 0;
+        this.short1Offset = 0; 
+        
+        this.hp = 10000; this.maxHp = 10000;
+        this.hitActive = false; 
+        
+        this.state = 0;       
+        this.stateTimer = 0;  
+        this.stunAccum = 0;   
+    }
+
+    setAnim(seq) {
+        this.animSeq = seq; this.animIdx = 0; this.delay = 0;
+        this.hitActive = false; this.short1Offset = 0;
+    }
+}
+
+let gs = new Int32Array(144); 
+let player, enemy, entities =[], cameraX = 0, lastLogicTime = 0;
+
+function initGame() {
+    player = new Entity(0, 0, 100, 180);
+    gs[25] = 0; player.setAnim(2); // IDLE 是 2!
+    entities.push(player);
+    
+    enemy = new Entity(7, 1, 250, 180); 
+    enemy.dir = -1; enemy.setAnim(261); 
+    entities.push(enemy);
+
+    requestAnimationFrame(mainLoop);
+}
+
+function advanceAnim(ent) {
+    if (ent.delay > 0) { ent.delay--; return; }
+    let seq = motionData[ent.charId][ent.animSeq];
+    if (!seq) { ent.delay = -1; return; }
+
+    let loops = 20; 
+    while (loops-- > 0) {
+        let op = seq[ent.animIdx++];
+        if (op === undefined) { ent.delay = -1; break; }
+
+        if (op < 4096) {
+            ent.frameId = op + ent.short1Offset; 
+            ent.delay = seq[ent.animIdx++];
+            ent.hitActive = true; 
+            break;
+        }
+        switch (op) {
+            case 4096: ent.animIdx = seq[ent.animIdx] * 2; break; 
+            case 4097: ent.delay = -1; return; 
+            case 4098: ent.animIdx--; ent.delay = -1; return; 
+            case 4099: ent.frameId = -1; ent.delay = seq[ent.animIdx++]; return; 
+            case 4101: ent.x += seq[ent.animIdx++] * ent.dir; break;
+            case 4103: ent.z = seq[ent.animIdx++]; break; 
+            case 4104: ent.dir = -ent.dir; break; 
+            case 4105: ent.animIdx++; break;
+            case 4106: ent.short1Offset = seq[ent.animIdx++]; break; 
+            case 4107: ent.y += seq[ent.animIdx++]; break;
+            case 4109: ent.animIdx++; break;
+            case 4110: break;
+            case 4111: ent.animIdx++; break; 
+            case 4112: ent.animIdx++; break; 
+            case 4113: ent.animIdx++; break; 
+            default:
+                ent.frameId = op + ent.short1Offset;
+                if (ent.frameId > 4000) ent.frameId = 0; 
+                ent.delay = seq[ent.animIdx++];
+                ent.hitActive = true;
+                return; 
+        }
+    }
+}
+
+function getHitDataEntry(frameId) {
+    if (frameId < 0) return null;
+    if (frameId < 512) return hitData[0] ? hitData[0][frameId] : null;
+    if (frameId >= 512 && frameId < 1024) return hitData[1] ? hitData[1][frameId & 511] : null; 
+    if (frameId >= 1536 && frameId < 2048) return hitData[2] ? hitData[2][frameId & 511] : null; 
+    return null;
+}
+
+function getHitbox(ent) {
+    let p = getHitDataEntry(ent.frameId);
+    if (p && p.length >= 8 && p[6] > 0) { 
+        let flip = (ent.type === 0) ? (ent.dir === -1) : (ent.dir === 1);
+        let ax = ent.x + (flip ? -p[4] : p[4]) - p[6];
+        let ay = ent.y + p[5] - p[7] + (ent.z >> 8);
+        return { x: ax, y: ay, w: p[6]*2, h: p[7]*2 };
+    }
+    return null;
+}
+
+function getHurtbox(ent) {
+    let p = getHitDataEntry(ent.frameId);
+    if (p && p.length >= 4 && p[2] > 0) { 
+        let flip = (ent.type === 0) ? (ent.dir === -1) : (ent.dir === 1);
+        let hx = ent.x + (flip ? -p[0] : p[0]) - p[2];
+        let hy = ent.y + p[1] - p[3] + (ent.z >> 8);
+        return { x: hx, y: hy, w: p[2]*2, h: p[3]*2 };
+    }
+    return null;
+}
+
+function checkCollision(hit, hurt, py, ey) {
+    if (Math.abs(py - ey) > 16) return false;
+    return !(hit.x + hit.w < hurt.x || hit.x > hurt.x + hurt.w || hit.y + hit.h < hurt.y || hit.y > hurt.y + hurt.h);
+}
+
+function mainLoop(time) {
+    requestAnimationFrame(mainLoop);
+    if (!lastLogicTime) lastLogicTime = time;
+    let delta = time - lastLogicTime;
+    if (delta > 200) { lastLogicTime = time - TICK_MS; delta = TICK_MS; }
+
+    if (delta >= TICK_MS) {
+        let ticks = Math.floor(delta / TICK_MS);
+        for (let i = 0; i < ticks; i++) {
+            pollInput();
+            updateLogic();
+        }
+        lastLogicTime += ticks * TICK_MS;
+        drawRender(); 
+    }
+}
+
+// ==========================================
+// 纯正 J2ME 逻辑 (完全隔离的状态层级)
+// ==========================================
+function updateLogic() {
+    let p = player;
+    let e = enemy;
+
+    // --- PlayerController.java: updatePlayerLogic_OnFoot ---
+    if (gs[25] < 2) { // 0=IDLE, 1=WALK
+        if (gs[75] <= 0) gs[20] = 0; 
+        
+        if (keyJustPressed.j) { // J = 普攻
+            gs[20] = 3; 
+            gs[75] = 0;
+            p.setAnim(3);
+            gs[25] = 2; 
+            gs[19] = 12;
+        } else if (keyJustPressed.k) { // K = 跳踢 (Anim 8, State 9)
+            gs[25] = 9;
+            p.vx = 0; p.vy = 0;
+            p.vz = 3328; // 终极还原：跳跃初速度 (13像素/帧)
+            gs[20] = 8;
+            p.setAnim(8); 
+        } else if (keyJustPressed.l) { // L = 步战保险 (Anim 33, State 33)
+            gs[25] = 33;
+            p.setAnim(33);
+        } else {
+            let vx = 0, vy = 0;
+            if (keyState.a) vx = -3; else if (keyState.d) vx = 3;
+            if (keyState.w) vy = -2; else if (keyState.s) vy = 2;
+
+            p.x += vx; p.y += vy;
+            if (vx !== 0) p.dir = vx > 0 ? 1 : -1;
+
+            if (vx !== 0 || vy !== 0) { 
+                if (gs[25] !== 1) { gs[25] = 1; p.setAnim(1); } // 完美修复移动卡第一帧
+            } else { 
+                if (gs[25] !== 0) { gs[25] = 0; p.setAnim(2); } // 完美切回待机 (2)
+            }
+        }
+    } else if (gs[25] <= 3) { // 2=ATK_RECOVERY, 3=COMBO
+        gs[75] = Math.max(0, gs[75] - 1); 
+
+        if (p.delay < 0) { // AnimFinished
+            if (gs[25] === 2) {
+                gs[25] = 0; p.setAnim(2); // 恢复待机
+            } else {
+                gs[20] = gs[21]; // 切下一拳
+                p.setAnim(gs[20]);
+                gs[25] = 2;
+                gs[19] = 7;
+            }
+        }
+
+        // 核心连招窗口：必须在 gs[75] (命中确认) > 0 时独立再按 J
+        if (gs[19] > 0 && COMBO_FINISHER_TABLE[gs[20]] !== 0 && keyJustPressed.j && gs[75] > 0) {
+            gs[19] = 0; gs[75] = 0;
+            gs[25] = 3;
+            gs[21] = COMBO_FINISHER_TABLE[gs[20]];
+        }
+    } else if (gs[25] === 9) { // 9=JUMP KICK
+        p.z -= p.vz;
+        p.vz -= 512; // 完美的重力 2.0像素/帧^2
+        if (p.vx === 0 && p.vz > 0) {
+            if (keyState.d) p.vx = 3;
+            else if (keyState.a) p.vx = -3;
+        }
+        p.x += p.vx;
+        if (p.z >= 0) {
+            p.z = 0; p.vx = 0; p.vz = 0;
+            gs[25] = 0; p.setAnim(2);
+        }
+    } else if (gs[25] === 33) { // 33=MAGIC / DESPERATION
+        p.stateTimer++;
+        // 模拟 J2ME tryExecuteDesperationMove 的写死半径 AoE (无视判定框)
+        if (e.hp > 0 && e.state !== 5 && e.state !== 1) {
+            let dx = Math.abs(e.x - p.x);
+            let dy = Math.abs(e.y - p.y);
+            if (dx < 64 && dy < 32) {
+                e.hp -= 8;
+                e.state = 1; // KNOCKDOWN
+                e.stateTimer = 0;
+                e.offsetY = KNOCKDOWN_Z[0];
+                e.stunAccum = 0;
+                e.dir = p.x > e.x ? 1 : -1;
+                e.setAnim(273); // 击飞帧
+            }
+        }
+        if (p.delay < 0) {
+            gs[25] = 0; p.setAnim(2);
+        }
+    }
+
+    // --- AIController.java: updateHitStun / Knockdown ---
+    if (e.state === 37) { // HITSTUN (37)
+        e.stateTimer--;
+        e.x += e.vx; 
+        if (e.delay < 0 || e.stateTimer <= 0) {
+            e.state = 0; // IDLE
+            e.setAnim(261);
+            e.vx = 0;
+        }
+    } else if (e.state === 1) { // KNOCKDOWN (1)
+        e.stateTimer++;
+        if (e.stateTimer < KNOCKDOWN_Z.length) {
+            e.offsetY += KNOCKDOWN_Z[e.stateTimer]; // J2ME 击退高度曲线
+            e.x += (e.dir === 1 ? -2 : 2); // 击退滑行
+        } else {
+            e.offsetY = 0;
+        }
+        if (e.stateTimer > 30) {
+            e.state = 0; // IDLE
+            e.setAnim(261);
+        }
+    }
+
+    // VM 推进
+    for (let ent of entities) advanceAnim(ent);
+
+    // --- Combat Collision ---
+    if (gs[20] >= 3 || gs[25] === 9) {
+        if (p.hitActive) {
+            let hit = getHitbox(p);
+            let hurt = getHurtbox(e);
+            if (hit && hurt && checkCollision(hit, hurt, p.y, e.y) && e.state !== 37 && e.state !== 1) {
+                p.hitActive = false; // 一击只打一次
+                gs[75] = 5; // 开启连招准许窗口
+                
+                e.hp = Math.max(0, e.hp - 10);
+                e.stunAccum += 2;
+                e.dir = p.x > e.x ? 1 : -1; // 面向玩家
+
+                let knockdown = e.stunAccum >= 6 || p.animSeq === 6 || gs[25] === 9;
+                if (knockdown) {
+                    e.stunAccum = 0;
+                    e.state = 1; // KNOCKDOWN
+                    e.stateTimer = 0;
+                    e.offsetY = KNOCKDOWN_Z[0]; 
+                    e.setAnim(273); // 击飞帧
+                } else {
+                    e.state = 37; // HITSTUN
+                    e.stateTimer = 15;
+                    e.vx = p.dir * 2; 
+                    e.setAnim(272); // 受击帧
+                }
+            }
+        }
+    }
+
+    // 边界与相机
+    if (p.x < cameraX + 15) p.x = cameraX + 15;
+    if (p.y < 140) p.y = 140;
+    if (p.y > 230) p.y = 230;
+    if (p.x > cameraX + 200) cameraX = p.x - 200;
+    if (p.x < cameraX + 50 && cameraX > 0) cameraX = p.x - 50;
+}
+
+// ==========================================
+// 渲染器 (Renderer)
+// ==========================================
+async function drawRender() {
+    const canvasObj = document.getElementById('canvas');
+    const ctx = canvasObj.getContext('2d');
+    
+    ctx.fillStyle = "#1e3b5e"; 
+    ctx.fillRect(0, 0, canvasObj.width, canvasObj.height);
+
+    let map = mapData[0];
+    if (map) {
+        let promises =[];
+        for (let part of map) promises.push(ensureImageLoaded(getGlobalImageId(part.imgId)));
+        await Promise.all(promises);
+        for (let i = map.length - 1; i >= 0; i--) {
+            let part = map[i];
+            let img = imageCache[getGlobalImageId(part.imgId)];
+            if (img) ctx.drawImage(img, part.ox - cameraX, part.oy + 42);
+        }
+    }
+
+    let renderList = [...entities].sort((a, b) => a.y - b.y);
+
+    let shadowImg = await ensureImageLoaded(288);
+    for (let ent of renderList) {
+        if (shadowImg) {
+            ctx.drawImage(shadowImg, ent.x - cameraX - 24, ent.y + 42 - 8);
+        }
+    }
+
+    for (let ent of renderList) {
+        if (ent.frameId < 0) continue;
+        let partsData = skleData[ent.charId];
+        if (!partsData) continue;
+        let parts = partsData[ent.frameId];
+        if (!parts) parts = partsData[0]; // 防止缺失帧崩溃
+
+        let promises =[];
+        for (let part of parts) promises.push(ensureImageLoaded(getGlobalImageId(part.imgId)));
+        await Promise.all(promises);
+
+        let renderX = ent.x - cameraX;
+        let renderY = ent.y + 42 + (ent.z >> 8) + ent.offsetY; // 完美的Z轴映射
+
+        ctx.save();
+        for (let i = parts.length - 1; i >= 0; i--) {
+            let part = parts[i];
+            let img = imageCache[getGlobalImageId(part.imgId)];
+            if (img) {
+                if (ent.dir === 1) {
+                    ctx.drawImage(img, renderX + part.ox, renderY + part.oy);
+                } else {
+                    ctx.save();
+                    ctx.translate(renderX - part.ox - img.width, renderY + part.oy);
+                    ctx.scale(-1, 1);
+                    ctx.drawImage(img, -img.width, 0); 
+                    ctx.restore();
+                }
+            }
+        }
+        ctx.restore();
+
+        if (showHitboxes) {
+            ctx.strokeStyle = "rgba(0, 255, 0, 0.8)"; ctx.lineWidth = 1; ctx.beginPath();
+            ctx.moveTo(renderX - 10, renderY); ctx.lineTo(renderX + 10, renderY);
+            ctx.moveTo(renderX, renderY - 10); ctx.lineTo(renderX, renderY + 10); ctx.stroke();
+
+            let hurt = getHurtbox(ent);
+            if (hurt) {
+                ctx.fillStyle = "rgba(0, 100, 255, 0.4)"; ctx.strokeStyle = "blue";
+                ctx.fillRect(hurt.x - cameraX, hurt.y + 42 + ent.offsetY, hurt.w, hurt.h); 
+                ctx.strokeRect(hurt.x - cameraX, hurt.y + 42 + ent.offsetY, hurt.w, hurt.h);
+            }
+            let hit = getHitbox(ent);
+            if (hit) {
+                ctx.fillStyle = "rgba(255, 0, 0, 0.4)"; ctx.strokeStyle = "red";
+                ctx.fillRect(hit.x - cameraX, hit.y + 42 + ent.offsetY, hit.w, hit.h); 
+                ctx.strokeRect(hit.x - cameraX, hit.y + 42 + ent.offsetY, hit.w, hit.h);
+            }
+        }
+    }
+}
+</script>
+</body>
+</html>
